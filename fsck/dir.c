@@ -15,6 +15,7 @@
  */
 #include "fsck.h"
 #include "node.h"
+#include <search.h>
 
 static int room_for_filename(const u8 *bitmap, int slots, int max_slots)
 {
@@ -634,10 +635,19 @@ int convert_inline_dentry(struct f2fs_sb_info *sbi, struct f2fs_node *node,
 	return 0;
 }
 
+int cmp_from_devino(const void *a, const void *b) {
+	u64 devino_a = ((struct hardlink_cache_entry*) a)->from_devino;
+	u64 devino_b = ((struct hardlink_cache_entry*) b)->from_devino;
+
+	return (devino_a > devino_b) - (devino_a < devino_b);
+}
+
 int f2fs_create(struct f2fs_sb_info *sbi, struct dentry *de)
 {
 	struct f2fs_node *parent, *child;
-	struct node_info ni;
+	struct hardlink_cache_entry *find_hardlink = 0, *found_hardlink = 0;
+	void *search_result;
+	struct node_info ni, hardlink_ni;
 	struct f2fs_summary sum;
 	block_t blkaddr = NULL_ADDR;
 	int ret;
@@ -671,10 +681,41 @@ int f2fs_create(struct f2fs_sb_info *sbi, struct dentry *de)
 		goto free_parent_dir;
 	}
 
+	if (de->from_devino != 0) {
+		/* This might be a hardlink, try to find it in the cache */
+		find_hardlink = calloc(1, sizeof(struct hardlink_cache_entry));
+		find_hardlink->from_devino = de->from_devino;
+		find_hardlink->to_ino = 0;
+
+		search_result = tsearch(find_hardlink, &(sbi->hardlink_cache), cmp_from_devino);
+		ASSERT(search_result != 0);
+
+		found_hardlink = *(struct hardlink_cache_entry**) search_result;
+		ASSERT(find_hardlink->from_devino == found_hardlink->from_devino);
+
+		/* If it was already in the cache, free the entry we just created */
+		if (found_hardlink != find_hardlink)
+			free(find_hardlink);
+	}
+
 	child = calloc(BLOCK_SZ, 1);
 	ASSERT(child);
 
-	f2fs_alloc_nid(sbi, &de->ino);
+	if ((found_hardlink != 0) && (found_hardlink->to_ino != 0)) {
+		/* If we found this devino in the cache, we're creating a hard link */
+		get_node_info(sbi, found_hardlink->to_ino, &hardlink_ni);
+		if (hardlink_ni.blk_addr == NULL_ADDR) {
+			MSG(0, "No original inode for hard link to_ino=%x\n", found_hardlink->to_ino);
+			return -1;
+		}
+
+		/* Use previously-recorded inode */
+		de->ino = found_hardlink->to_ino;
+		blkaddr = hardlink_ni.blk_addr;
+		MSG(0, "Creating \"%s\" as hard link to inode %d\n", de->path, de->ino);
+	} else {
+		f2fs_alloc_nid(sbi, &de->ino);
+	}
 
 	init_inode_block(sbi, child, de);
 
@@ -689,6 +730,26 @@ int f2fs_create(struct f2fs_sb_info *sbi, struct dentry *de)
 		goto free_child_dir;
 	}
 
+	if (found_hardlink != 0) {
+		if (found_hardlink->to_ino == 0) {
+			MSG(0, "Adding inode %d from %s to hardlink cache\n", de->ino, de->path);
+			found_hardlink->to_ino = de->ino;
+		} else {
+			/* Replace child with original block */
+			free(child);
+			child = calloc(BLOCK_SZ, 1);
+			ASSERT(child);
+
+			ret = dev_read_block(child, blkaddr);
+			ASSERT(ret >= 0);
+
+			/* Increment links and skip to writing block */
+			child->i.i_links++;
+			MSG(0, "Number of links on inode %d is now %d\n", de->ino, child->i.i_links);
+			goto write_child_dir;
+		}
+	}
+
 	/* write child */
 	set_summary(&sum, de->ino, 0, ni.version);
 	ret = reserve_new_block(sbi, &blkaddr, &sum, CURSEG_HOT_NODE, 1);
@@ -697,6 +758,7 @@ int f2fs_create(struct f2fs_sb_info *sbi, struct dentry *de)
 	/* update nat info */
 	update_nat_blkaddr(sbi, de->ino, de->ino, blkaddr);
 
+write_child_dir:
 	ret = dev_write_block(child, blkaddr);
 	ASSERT(ret >= 0);
 
